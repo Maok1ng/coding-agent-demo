@@ -1,0 +1,6 @@
+{
+  "api_key": "YOUR_API_KEY",
+  "base_url": "https://api.anthropic.com",
+  "model": "YOUR_MODEL_NAME",
+  "max_tokens": 8000
+}

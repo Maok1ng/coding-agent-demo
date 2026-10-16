@@ -1,0 +1,18 @@
+#本机凭据与 Agent 运行数据不进入版本控制。
+config.json
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
+.venv/
+build/
+dist/
+*.egg-info/
+.refactor-backups/
+.tasks/
+.mailboxes/
+.worktrees/
+.transcripts/
+.task_outputs/
+.scheduled_tasks.json
+.scheduled_tasks.json.*.tmp

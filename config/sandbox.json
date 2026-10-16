@@ -1,0 +1,9 @@
+{
+  "backend": "local",
+  "image": "coding-agent-sandbox:local",
+  "timeout": 120,
+  "cpus": 2,
+  "memory": "2g",
+  "pids_limit": 128,
+  "network": "none"
+}

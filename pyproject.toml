@@ -1,0 +1,10 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+#先检查未定义名称、重复定义和未使用导入，不批量重排已有注释及排版。
+select = ["F"]
