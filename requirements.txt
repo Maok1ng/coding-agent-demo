@@ -1,3 +1,8 @@
 #与当前 agent 环境已验证的运行依赖保持一致；测试使用标准库 unittest。
 anthropic==1.7.0
 PyYAML==6.0.3
+mcp==2.3.0
+httpx2==2.13.0
+jsonschema==4.26.0
+pathspec==1.1.1
+Pillow==13.0.0

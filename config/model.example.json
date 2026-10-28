@@ -2,5 +2,10 @@
   "api_key": "YOUR_API_KEY",
   "base_url": "https://api.anthropic.com",
   "model": "YOUR_MODEL_NAME",
-  "max_tokens": 8000
+  "max_tokens": 8000,
+  "context_token_limit": 16000,
+  "approval_mode": "auto",
+  "stream": true,
+  "memory_enabled": true,
+  "memory_auto_extract": true
 }

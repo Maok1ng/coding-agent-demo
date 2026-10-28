@@ -42,6 +42,9 @@ class SkillLoader:
                 return
     
             skills_root = self.skills_dir.resolve()#获取绝对路径
+            #整个 skills/ 被链接到工作区外时，也不能绕过文件工具的读取边界。
+            if not skills_root.is_relative_to(self.skills_dir.parent.resolve()):
+                return
             for manifest in sorted(self.skills_dir.glob("*/SKILL.md")): #扫描类似路径 skills/xxx/SKILL.md #sorted(...) 则是让文件按路径排序，保证每次扫描顺序稳定。
                 if (not manifest.is_file() #检查xxx/SKILL.md是不是一个文件
                         or not manifest.resolve().is_relative_to(skills_root)):#安全检查 避免符号链接指向skill目录之外的东西

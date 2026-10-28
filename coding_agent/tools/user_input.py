@@ -73,7 +73,8 @@ class UserInput:
                     return
         raise ValueError("找不到待回答问题的 tool_result")
 
-    def answer(self, messages, text):
+    def validate_answer(self, text):
+        """纯校验并解析答案；CLI 可提前提示错误，但这里不清除问题或修改历史。"""
         if self.pending is None:
             return text
         if not text.strip():
@@ -85,6 +86,12 @@ class UserInput:
             if not 1 <= number <= len(self.pending.options):
                 raise ValueError("选项编号超出范围，请选择有效编号或直接输入文字")
             text = self.pending.options[number - 1]
+        return text
+
+    def answer(self, messages, text):
+        if self.pending is None:
+            return text
+        text = self.validate_answer(text)
         self._update_tool_result(messages, "answered", text)
         self.pending = None
         return text

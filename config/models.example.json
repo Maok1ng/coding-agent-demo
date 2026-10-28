@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "default": "general",
+  "profiles": {
+    "general": {
+      "model": "YOUR_GENERAL_MODEL_ID",
+      "supports_images": false,
+      "max_tokens": 8000,
+      "context_token_limit": 64000
+    },
+    "fast": {
+      "model": "YOUR_FAST_MODEL_ID",
+      "supports_images": false,
+      "max_tokens": 3000,
+      "context_token_limit": 32000
+    },
+    "coding": {
+      "model": "YOUR_CODING_MODEL_ID",
+      "supports_images": false,
+      "max_tokens": 8000,
+      "context_token_limit": 64000
+    }
+  },
+  "bindings": {
+    "codebase": "fast",
+    "implementation": "coding",
+    "memory": "fast",
+    "compaction": "fast"
+  }
+}

@@ -1,0 +1,9 @@
+#只把公开源码、样例和开发资料加入 sdist；不要使用 graft . 收集整个工作区。
+include README.md LICENSE pyproject.toml requirements.txt main.py Makefile
+recursive-include coding_agent *.py
+recursive-include docs *.md
+recursive-include tests *.py
+recursive-include scripts *.py
+include config/model.example.json config/models.example.json config/mcp.example.json config/mcp.browser.example.json config/sandbox.json
+include docker/Dockerfile
+global-exclude __pycache__ *.py[cod]

@@ -1,0 +1,26 @@
+{
+  "mcpServers": {
+    "github": {
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/readonly",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_MCP_TOKEN}"
+      },
+      "allowed_tools": [
+        "search_repositories",
+        "search_code",
+        "search_issues",
+        "get_file_contents"
+      ],
+      "read_only_tools": [
+        "search_repositories",
+        "search_code",
+        "search_issues",
+        "get_file_contents"
+      ],
+      "auto_approve": [],
+      "connect_timeout": 15,
+      "timeout": 60
+    }
+  }
+}

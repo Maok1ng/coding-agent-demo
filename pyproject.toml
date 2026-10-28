@@ -1,3 +1,40 @@
+[build-system]
+requires = ["setuptools>=77.0.3"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coding-agent-demo"
+description = "A focused coding-agent harness with specialist roles, Plan permissions, sessions and MCP."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dynamic = ["version", "dependencies"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+]
+
+[project.scripts]
+coding-agent = "coding_agent.cli:main"
+
+[project.optional-dependencies]
+dev = ["ruff>=0.9,<1", "setuptools>=77.0.3", "wheel"]
+
+[tool.setuptools]
+include-package-data = false
+
+[tool.setuptools.packages.find]
+include = ["coding_agent", "coding_agent.*"]
+namespaces = false
+
+[tool.setuptools.dynamic]
+#运行依赖只维护 requirements.txt；避免两份版本清单逐渐不一致。
+dependencies = {file = ["requirements.txt"]}
+version = {attr = "coding_agent.__version__"}
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]

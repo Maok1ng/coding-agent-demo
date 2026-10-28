@@ -1,5 +1,11 @@
 #本机凭据与 Agent 运行数据不进入版本控制。
 config.json
+config/mcp.json
+config/models.json
+models.json
+.models.json.lock
+.env
+.env.*
 __pycache__/
 .pytest_cache/
 .ruff_cache/
@@ -14,5 +20,7 @@ dist/
 .worktrees/
 .transcripts/
 .task_outputs/
+.sessions/
+.memory/
 .scheduled_tasks.json
 .scheduled_tasks.json.*.tmp

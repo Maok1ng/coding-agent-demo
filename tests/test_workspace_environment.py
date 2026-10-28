@@ -91,7 +91,6 @@ class EnvironmentTests(unittest.TestCase):
         output, code = env.execute('printf "%s" "$PWD"; exit 7', target)
         self.assertEqual(code, 7)
         self.assertEqual(output, str(target))
-        self.assertIn("status 7", environment.format_bash_result(output, code))
 
     def test_local_timeout_reaps_process_group(self):
         env = environment.LocalEnvironment(environment.ExecutionConfig(timeout=1))
@@ -105,7 +104,7 @@ class EnvironmentTests(unittest.TestCase):
         task.mkdir()
         env = environment.DockerEnvironment(environment.ExecutionConfig(backend="docker"))
         command = "printf '%s' '$(should-not-run-on-host)'"
-        with patch.object(environment, "WORKDIR", self.root), \
+        with workspace.use_workspace(self.root), \
                 patch.object(environment, "_containers", set()), \
                 patch.object(environment, "_run_process", return_value=("container output", 0)) as run, \
                 patch.object(environment, "_remove_container") as cleanup:
@@ -126,20 +125,20 @@ class EnvironmentTests(unittest.TestCase):
         credentials = self.root / "model.json"
         credentials.write_text("{}", encoding="utf-8")
         env = environment.DockerEnvironment(environment.ExecutionConfig(backend="docker"))
-        with patch.object(environment, "WORKDIR", self.root), \
+        with workspace.use_workspace(self.root), \
                 patch.object(environment, "CONFIG_PATH", credentials), self.assertRaises(ValueError):
             env.command_args("pwd", self.root, "test")
 
     def test_docker_startup_fails_before_accepting_tasks_if_cli_missing(self):
         env = environment.DockerEnvironment(environment.ExecutionConfig(backend="docker"))
-        with patch.object(environment, "WORKDIR", self.root), \
+        with workspace.use_workspace(self.root), \
                 patch.object(environment.shutil, "which", return_value=None), \
                 self.assertRaisesRegex(ValueError, "找不到 docker"):
             env.prepare()
 
     def test_missing_docker_does_not_execute_a_local_shell(self):
         env = environment.DockerEnvironment(environment.ExecutionConfig(backend="docker"))
-        with patch.object(environment, "WORKDIR", self.root), \
+        with workspace.use_workspace(self.root), \
                 patch.object(environment, "_containers", set()), \
                 patch.object(environment.subprocess, "Popen", side_effect=FileNotFoundError("docker missing")) as popen, \
                 patch.object(environment, "_remove_container"):

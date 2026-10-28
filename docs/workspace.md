@@ -1,77 +1,69 @@
-# 工作目录与可选 Docker 沙箱
+# 工作目录与 Docker 执行后端
 
-程序目录和目标项目目录分开管理，目录选择集中在 `coding_agent/runtime/workspace.py`。
+Agent 的宿主配置和用户的目标项目分开管理；目录选择集中在 `runtime/workspace.py`。
 
-| 目录或文件 | 解析规则 |
+| 项目 | 默认位置与覆盖方式 |
 | --- | --- |
-| `APP_DIR` | `main.py` 所在目录，不受终端 `cd` 影响 |
-| `CONFIG_PATH` | 默认 `APP_DIR/config.json`；可用 `--config` 或 `AGENT_CONFIG` 指定 |
-| `WORKDIR` | 默认 `APP_DIR`，兼容已有数据；可用 `--workspace` 或 `AGENT_WORKSPACE` 指定 |
-| `.tasks`、`.mailboxes`、`.transcripts`、`.scheduled_tasks.json` 等 | 仍保存在所选 `WORKDIR` 中，没有迁移或删除原数据 |
-| Skills | 读取所选工作区的 `skills/` |
-| Task/worktree 目录 | 认领后由 assignment 指定；同步命令、文件工具、后台 Bash、一次性子 Agent 都继承它 |
+| 程序目录 | 源码/可编辑安装为项目根目录；wheel 安装的宿主配置目录为 `~/.coding-agent` |
+| 模型配置 | 程序目录的 `config.json`；`--config` 或 `AGENT_CONFIG` 覆盖 |
+| 工作区 | 源码/可编辑安装默认程序目录；wheel 默认启动终端当前目录；`--workspace` 或 `AGENT_WORKSPACE` 覆盖 |
+| MCP 配置 | 宿主的 `config/mcp.json`；`--mcp-config` 或 `AGENT_MCP_CONFIG` 覆盖 |
+| 用户规则 / 记忆 | `~/.coding-agent/AGENTS.md` 与 `memory/`；宿主 `--memory-home`、`AGENT_MEMORY_HOME` 或模型配置 `memory_home` 覆盖 |
+| 项目约定 / Skills | 只读取工作区根目录 `AGENTS.md`，Skills 从工作区 `skills/` 按需加载 |
+| 项目经验记忆 | 当前工作区 `.memory/`，不向父 Git 仓库扩大范围 |
+| 会话 / 运行记录 | 工作区的 `.sessions/`、`.transcripts/`、`.task_outputs/` |
 
-显式传入的相对路径按启动终端的位置解析一次，此后全部使用绝对路径。
-线程不会调用 `os.chdir()`；子 Agent 使用 `ContextVar` 临时继承目录，避免影响其他队友。
-环境变量应在启动进程前设置；运行过程中不能更换工作区。
-
-## 选择工作区
-
-下面命令可以从任意终端目录运行（先激活自己的 `agent` 环境）：
+显式相对路径以启动终端为基准解析一次。工作区必须存在；进程不调用 `os.chdir()`。
+RunContext 向所有专业角色传递同一工作区，文件工具拒绝 `..` 或符号链接逃逸。
+角色不能通过委派参数更换宿主配置、工作区或权限。
+核心 API 通过宿主 ContextVar 绑定工作区，不要求先调用 CLI 或改写全局目录；
+Skills 目录和 Shell 输出也使用当前运行的工作区，后台线程显式继承这一边界。
 
 ```bash
 python '/path/to/coding-agent-demo/main.py' \
-  --workspace /absolute/path/to/target-project
+  --workspace /absolute/path/to/target-project \
+  --config /absolute/path/to/agent-config.json
 ```
 
-工作区必须是已经存在的目录；不提供参数时仍操作本 demo 目录。
-模型配置继续读取 Agent 程序目录的 `config.json`，不会误读目标仓库的同名文件。
+目标仓库中的同名模型/MCP 配置不会被自动加载。`AGENTS.md` 是项目说明，不是用户授权：
+其中的文字不能解除 Plan、提升角色权限，或替用户批准外部工具。
+宿主规则目录只由宿主配置指定，不从目标项目的文件中读取；用户级记忆的上级目录须已存在。
+自动记忆读写在宿主执行，并不进入 Docker；普通代码搜索默认跳过 `.memory/`，避免把全部私人经验当源码索引。
 
 ## Docker 后端
 
-`config/sandbox.json` 默认使用 `local`，仅在显式传入 `--execution docker` 或修改后端配置后启用 Docker。
-Shell 统一经过 `coding_agent/runtime/environment.py`；Docker 启动失败不会回退到本机。
-模型 API、权限确认、任务板和 worktree 管理由宿主进程负责。
+默认使用本地 Shell；显式传入 `--execution docker` 或在宿主沙箱配置中选择 Docker 后才启用。
+只有 Implementation 在 Execute 模式中可运行 Shell，所有命令都通过 Environment。
+Docker 失败不会悄悄回退到宿主执行。
 
-先在已经安装并启动 Docker 的机器上构建工具镜像：
-
-```bash
-docker build -t coding-agent-sandbox:local \
-  '/path/to/coding-agent-demo/docker'
-```
-
-然后选择一个独立目标项目：
+先在已安装并运行 Docker 的机器上构建镜像：
 
 ```bash
+docker build -t coding-agent-sandbox:local '/path/to/coding-agent-demo/docker'
 python '/path/to/coding-agent-demo/main.py' \
   --workspace /absolute/path/to/target-project \
   --execution docker
 ```
 
-运行时使用 `--pull never`，不会自动下载镜像。CLI 在接收任务前检查 Docker CLI、daemon 和镜像是否就绪；
-执行期间出现错误仍会返回给工具调用。
-基础镜像提供 Python、pytest、ruff、git、rg；目标项目所需的额外依赖需要提前加入镜像。
-`AGENT_DOCKER_IMAGE` 可选择自己的镜像。
+运行使用 `--pull never`，不自动下载镜像；CLI 检查 Docker CLI、daemon 和镜像是否就绪。
+镜像提供 Python、pytest、ruff、git、rg；项目额外依赖需要预装镜像或放在工作区内。
+可用 `AGENT_DOCKER_IMAGE` 选择自己的镜像。
 
-每条 Shell 命令启动一个临时容器。默认无网络、只读根文件系统、移除 capabilities、禁止提权，
-限制为 2 CPU / 2 GiB 内存 / 128 个进程；`/tmp` 可写。
-如任务确实需要网络，可以由宿主修改 `config/sandbox.json` 的 `network` 为 `bridge`。
+每条命令启动临时容器，默认无网络、只读根文件系统、移除 capabilities、禁止提权，
+限制为 2 CPU / 2 GiB 内存 / 128 进程，`/tmp` 可写。网络需求由宿主沙箱配置显式决定。
+工作区以相同绝对路径可写挂载，文件改动会直接影响用户项目，不是一次性副本。
+命令之间不保留容器中的 `cd`、`export` 或系统目录安装结果；容器使用 Linux，不使用宿主 Conda 环境。
 
-工作区以**相同绝对路径**可写挂载到容器，所以宿主文件工具和容器里的 Shell 操作同一份文件，
-也无需把模型生成的路径在 `/workspace` 与宿主路径之间来回替换。
-写入工作区会直接改变目标项目文件；该方案不是“一次性副本”。工作区以外的宿主目录不挂载。
-容器读取不到宿主进程的模型 API 环境变量；工作区若包含 Agent 的模型配置文件会拒绝启用 Docker。
-目标仓库自身的凭据文件仍属于挂载内容，应由宿主决定放入哪些文件。
+## 隔离边界与清理
 
-文件修改在命令间保留，`cd`、`export`、`pip install` 到容器系统目录的结果和后台服务不会保留。
-需要跨命令使用的依赖应预装镜像或安装到工作区内的虚拟环境。
-容器内运行的是 Linux，不会使用宿主 macOS 的 Conda Python。
+- Docker 只隔离 Shell。文件编辑、固定参数的 Git 查询、模型请求和 MCP 客户端仍在宿主。
+- 只读根文件系统不等于只读工作区；Plan 的禁止写入由 ToolRuntime 保证。
+- 容器不继承宿主模型 API 环境变量；工作区包含 Agent 模型配置时拒绝启用 Docker。
+  目标项目自身的凭据仍可能位于挂载目录，应由用户管理。
+- 后台命令和临时容器归当前 Turn；正常结束、中断或退出时清理，不跨会话恢复。
+- 已有 Git worktree 可以作为用户选择的工作区，但不再由 Agent 自动认领、创建或释放。
+  若其 Git 元数据位于工作区外，容器内可能无法访问，不能据此扩大挂载范围。
+- 旧 `.tasks`、`.mailboxes`、`.scheduled_tasks.json` 和已有 worktree 不自动删除，
+  也不再作为旧 Team/Cron 调度状态加载。
 
-Git 项目建议把 `--workspace` 指向仓库根目录：内部创建的 `.worktrees` 和主仓库 `.git` 会一起挂载。
-已有 worktree 的 Git 元数据若在工作区外，容器内 Git 无法访问它；宿主管理的 Git 工具仍使用宿主环境。
-所有队友共享所选工作区这一挂载边界，Task 工作目录不构成额外的容器隔离边界。
-
-Docker 的 `run`、bind mount 和网络选项见官方说明：
-[docker run](https://docs.docker.com/reference/cli/docker/container/run/)、
-[bind mounts](https://docs.docker.com/engine/storage/bind-mounts/)、
-[none network](https://docs.docker.com/engine/network/drivers/none/)。
+这些约束不能把不可信代码变成安全代码；MCP stdio 服务也不自动受 Docker 后端隔离。

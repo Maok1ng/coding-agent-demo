@@ -10,9 +10,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from coding_agent.agents import subagent, team
-from coding_agent.runtime import background, environment, hooks, permissions, workspace
+from coding_agent.application import Application
+from coding_agent.agents.runner import AgentRunner
+from coding_agent.runtime import environment, hooks, workspace
+from coding_agent.runtime.approval import approval_decision
 from coding_agent.tools import files
+from tests.test_application import report_response
 
 
 class StructureTests(unittest.TestCase):
@@ -50,22 +53,68 @@ class StructureTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn(f"Workspace: {project}", result.stdout)
 
-    def test_team_and_subagent_reuse_file_tool_implementations(self):
-        for name in ("run_bash", "run_read", "run_write", "run_edit", "run_glob"):
-            self.assertIs(getattr(team, name), getattr(files, name))
-            self.assertIs(getattr(subagent, name), getattr(files, name))
-        self.assertIs(background.format_bash_result, environment.format_bash_result)
+    def test_application_and_specialists_share_one_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            roles = []
 
-    def test_background_schema_does_not_change_teammate_schema(self):
+            def model(client, **kwargs):
+                role = next(line.removeprefix("Role: ") for line in kwargs["system"].splitlines()
+                            if line.startswith("Role: "))
+                roles.append(role)
+                if roles == ["orchestrator"]:
+                    content = [{"type": "tool_use", "id": "delegate", "name": "dispatch_agent", "input": {
+                        "role": "codebase", "instruction": "Locate the entry point",
+                    }}]
+                elif role == "codebase":
+                    return report_response("codebase", "codebase result")
+                else:
+                    content = [{"type": "text", "text": f"{role} result"}]
+                return types.SimpleNamespace(content=content)
+
+            io = types.SimpleNamespace(emit=Mock(), confirm=Mock(return_value=True))
+            with patch.object(workspace, "WORKDIR", root), \
+                    patch("coding_agent.integrations.mcp.get_mcp_config", return_value={}), \
+                    patch.dict(hooks.HOOKS, {name: [] for name in hooks.HOOKS}):
+                application = Application({"model": "fake"}, root, io,
+                                          client=types.SimpleNamespace(close=Mock()),
+                                          model_call=model, evaluator=Mock())
+                self.assertIsInstance(application.runner, AgentRunner)
+                with patch.object(application.runner, "run", wraps=application.runner.run) as run:
+                    result = application.submit("Explain the entry point")
+                self.assertEqual(result.status, "completed")
+                self.assertEqual(roles, ["orchestrator", "codebase", "orchestrator"])
+                self.assertEqual([call.args[0].role for call in run.call_args_list], ["orchestrator", "codebase"])
+                contexts = [call.args[1] for call in run.call_args_list]
+                self.assertIs(contexts[0].turn, contexts[1].turn)
+                self.assertIs(contexts[0].versions, contexts[1].versions)
+                application.close()
+
+    def test_background_schema_copy_does_not_change_shared_schema(self):
         lead = files.base_tools(background=True)
         self.assertIn("run_in_background", lead[0]["input_schema"]["properties"])
         self.assertNotIn("run_in_background", files.BASE_TOOLS[0]["input_schema"]["properties"])
-        self.assertIs(team.BASE_TOOLS, files.BASE_TOOLS)
-        self.assertEqual(len({tool["name"] for tool in subagent.SUB_TOOLS}), len(subagent.SUB_TOOLS))
+        names = [tool["name"] for tool in files.BASE_TOOLS]
+        self.assertEqual(len(set(names)), len(names))
+        self.assertTrue({"read_file", "search_code", "git_status", "git_diff"} <= set(names))
 
-    def test_importing_cli_and_subagent_does_not_read_model_credentials(self):
+    def test_importing_application_and_runner_has_no_credentials_threads_or_legacy_dependencies(self):
+        source = """
+import sys
+import threading
+from unittest.mock import patch
+with patch.object(threading.Thread, 'start', side_effect=AssertionError('import started a thread')):
+    import coding_agent.cli
+    from coding_agent.application import Application
+    from coding_agent.agents.runner import AgentRunner
+    assert not {
+        'coding_agent.agents.loop', 'coding_agent.agents.team',
+        'coding_agent.agents.subagent', 'coding_agent.runtime.cron',
+    }.intersection(sys.modules)
+print('ok')
+"""
         result = subprocess.run(
-            [sys.executable, "-c", "import coding_agent.cli; import coding_agent.agents.subagent; print('ok')"],
+            [sys.executable, "-c", source],
             cwd=workspace.APP_DIR,
             env={**os.environ, "AGENT_CONFIG": "/nonexistent-model-config.json"},
             text=True, capture_output=True, timeout=10,
@@ -73,18 +122,18 @@ class StructureTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "ok")
 
-    def test_noninteractive_permission_check_never_prompts(self):
-        block = types.SimpleNamespace(name="bash", input={"command": "rm old-file"})
-        with patch("builtins.input", side_effect=AssertionError("must not prompt")):
-            self.assertFalse(permissions.check_permission(block, prompt_user=False))
-            self.assertIsNotNone(team.check_permission(block, prompt_user=False))
+    def test_approval_policy_returns_decision_without_reading_terminal(self):
+        with patch("coding_agent.runtime.terminal.read_user_input", side_effect=AssertionError("must not prompt")):
+            decision = approval_decision("auto", "bash", {"command": "rm old-file"}, workspace.APP_DIR)
+        self.assertEqual(decision.action, "confirm")
 
-    def test_skipping_duplicate_permission_still_runs_other_hooks(self):
+    def test_hooks_do_not_register_legacy_permission_or_duplicate_confirmation(self):
+        self.assertEqual(hooks.HOOKS["PreToolUse"], [hooks.log_hook])
         logger = Mock()
-        registry = {"PreToolUse": [hooks.permission_check_hook, logger]}
+        registry = {"PreToolUse": [logger]}
         with patch.dict(hooks.HOOKS, registry), \
-                patch.object(permissions, "check_permission", side_effect=AssertionError("already checked")):
-            hooks.trigger_hook("PreToolUse", object(), skip_permission=True)
+                patch("coding_agent.runtime.terminal.read_user_input", side_effect=AssertionError("must not prompt")):
+            hooks.trigger_hook("PreToolUse", object())
         logger.assert_called_once()
 
 
@@ -95,14 +144,15 @@ class SharedFileToolTests(unittest.TestCase):
             task = root / "task"
             task.mkdir()
             with patch.object(workspace, "WORKDIR", root):
-                self.assertTrue(files.run_write("answer.txt", "old old", cwd=task).startswith("Wrote"))
-                self.assertTrue(files.run_edit("answer.txt", "old", "new", cwd=task).startswith("Error"))
-                self.assertEqual(files.run_read("answer.txt", cwd=task), "old old")
-                self.assertTrue(files.run_edit("answer.txt", "old old", "new", cwd=task).startswith("Edited"))
-                self.assertEqual(files.run_read("answer.txt", cwd=task), "new")
-                self.assertTrue(files.run_edit("answer.txt", "", "new", cwd=task).startswith("Error"))
-                self.assertEqual(files.run_glob("*.txt", cwd=task), "answer.txt")
-                self.assertTrue(files.run_write("../escape.txt", "no", cwd=task).startswith("Error"))
+                tools = files.FileTools(task)
+                self.assertTrue(tools.write("answer.txt", "old old").startswith("Wrote"))
+                self.assertTrue(tools.edit("answer.txt", "old", "new").startswith("Error"))
+                self.assertIn("old old", tools.read("answer.txt"))
+                self.assertTrue(tools.edit("answer.txt", "old old", "new").startswith("Edited"))
+                self.assertIn("new", tools.read("answer.txt"))
+                self.assertTrue(tools.edit("answer.txt", "", "new").startswith("Error"))
+                self.assertEqual(tools.glob("*.txt"), "answer.txt")
+                self.assertTrue(tools.write("../escape.txt", "no").startswith("Error"))
                 self.assertFalse((root / "answer.txt").exists())
 
 

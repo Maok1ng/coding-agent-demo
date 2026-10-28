@@ -21,10 +21,9 @@ class DockerIntegrationTests(unittest.TestCase):
         self.root = Path(directory.name).resolve()
         self.task = self.root / "project with spaces"
         self.task.mkdir()
-        for module in (workspace, environment):
-            change = patch.object(module, "WORKDIR", self.root)
-            change.start()
-            self.addCleanup(change.stop)
+        scope = workspace.use_workspace(self.root)
+        scope.__enter__()
+        self.addCleanup(scope.__exit__, None, None, None)
         self.env = environment.DockerEnvironment(environment.ExecutionConfig(backend="docker"))
         self.env.prepare()
 

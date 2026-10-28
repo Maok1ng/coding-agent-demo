@@ -54,13 +54,3 @@ class TodoManager:
             }[todo["status"]]
             lines.append(f"{marker} {todo['content']}")
         return "\n".join(lines)
-   
-
-To_do = TodoManager()
-def run_todo_write(todos: list | str) -> str:
-    try:
-        output = To_do.update(todos)
-    except ValueError as e:
-        return f"Error: {e}"
-    print(output)
-    return output

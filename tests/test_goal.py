@@ -1,28 +1,26 @@
-"""无网络测试：验收协议、主循环续跑、子会话隔离与失败边界。"""
+"""Goal 控制器与验收协议；应用编排集成回归见 test_application。"""
 
 import copy
-import importlib.util
 import io
 import json
-import sys
-import tempfile
 import types
 import unittest
-from contextlib import ExitStack, redirect_stdout
-from pathlib import Path
-from unittest.mock import Mock, patch
+from contextlib import redirect_stdout
+from unittest.mock import Mock
 
 from coding_agent.runtime.goal import GoalController, GoalError, GoalEvaluation, PromptGoalEvaluator, transcript_text
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+class FakeBlock(types.SimpleNamespace):
+    def model_dump(self, **kwargs):
+        return vars(self)
 
 
 def text_response(text):
-    return types.SimpleNamespace(content=[types.SimpleNamespace(type="text", text=text)])
+    return types.SimpleNamespace(content=[FakeBlock(type="text", text=text)])
 
 
 def tool_call(name, arguments, tool_id="tool-1"):
-    return types.SimpleNamespace(type="tool_use", id=tool_id, name=name, input=arguments)
+    return FakeBlock(type="tool_use", id=tool_id, name=name, input=arguments)
 
 
 def tool_response(*blocks):
@@ -56,7 +54,7 @@ class GoalTests(unittest.TestCase):
         self.assertEqual(evaluator.evaluate("tests pass", history).decision, "complete")
         call = client.messages.calls[0]
         self.assertNotIn("tools", call)
-        payload = json.loads(call["messages"][0]["content"])
+        payload = json.loads(call["messages"][0]["content"][0]["text"])
         self.assertIn("test-1", payload["conversation"])
         self.assertIn("exit_code=0", payload["conversation"])
 
@@ -96,357 +94,157 @@ class GoalTests(unittest.TestCase):
         self.assertIsNone(controller.stop_hook(list(messages)))
         evaluator.evaluate.assert_not_called()
 
-    def test_pending_background_defers_without_evaluation(self):
+    def test_pause_retains_goal_progress_but_cancels_pending_question(self):
+        controller = GoalController(Mock())
+        controller.set_goal("finish login")
+        messages = []
+        controller.begin_query(messages)
+        result = controller.user_input.ask("Which database?", tool_use_id="ask-1")
+        messages.append({"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "ask-1", "content": result,
+        }]})
+        controller.wait_for_user("missing database preference")
+        controller.active.evaluations = 3
+        state = controller.active
+
+        controller.pause()
+
+        self.assertIs(controller.active, state)
+        self.assertEqual(state.condition, "finish login")
+        self.assertEqual(state.evaluations, 3)
+        self.assertEqual(state.status, "paused")
+        self.assertIsNone(controller.user_input.pending)
+        self.assertEqual(json.loads(messages[-1]["content"][0]["content"])["status"], "cancelled")
+
+    def test_paused_goal_never_evaluates_or_runs_automatically(self):
         evaluator = Mock()
-        controller = GoalController(evaluator, background_pending=lambda: True)
-        controller.set_goal("tests pass")
+        controller = GoalController(evaluator)
+        controller.set_goal("finish login")
+        messages = []
+        controller.begin_query(messages)
+        controller.pause()
+
+        self.assertFalse(controller.is_running())
+        self.assertIsNone(controller.stop_hook(messages))
+        evaluator.evaluate.assert_not_called()
+        self.assertEqual(controller.active.status, "paused")
+
+    def test_paused_context_does_not_reintroduce_old_goal(self):
+        controller = GoalController(Mock())
+        controller.set_goal("finish login")
+        controller.pause()
+
+        context = controller.worker_context()
+
+        self.assertTrue(context)
+        self.assertNotIn("finish login", context)
+        self.assertNotIn("Work toward this goal", context)
+
+    def test_normal_input_does_not_resume_a_paused_goal(self):
+        controller = GoalController(Mock())
+        controller.set_goal("finish login")
+        controller.pause()
+
+        self.assertEqual(controller.resume_from_user([], "解释装饰器"), "解释装饰器")
+        self.assertEqual(controller.active.status, "paused")
+        self.assertFalse(controller.is_running())
+
+    def test_explicit_resume_reactivates_retained_goal(self):
+        controller = GoalController(Mock())
+        controller.set_goal("finish login")
+        controller.active.evaluations = 3
+        controller.pause()
+
+        self.assertEqual(controller.resume(), "finish login")
+        self.assertEqual(controller.active.status, "active")
+        self.assertEqual(controller.active.evaluations, 3)
+        self.assertTrue(controller.is_running())
+        self.assertIn("finish login", controller.worker_context())
+
+    def test_explicit_resume_without_a_goal_is_rejected(self):
+        controller = GoalController(Mock())
+        with self.assertRaises(GoalError):
+            controller.resume()
+
+    def test_edit_keeps_progress_and_records_the_previous_goal(self):
+        controller = GoalController(Mock())
+        controller.set_goal("finish login and registration")
+        messages = []
+        controller.begin_query(messages)
+        controller.user_input.ask("Which database?")
+        controller.active.evaluations = 3
+        controller.active.last_reason = "registration tests pending"
+        controller.active.status = "blocked"
+        controller.consecutive_blocks = 2
+
+        self.assertEqual(controller.edit("  finish login only  "), "finish login only")
+
+        self.assertEqual(controller.active.condition, "finish login only")
+        self.assertEqual(controller.active.status, "active")
+        self.assertEqual(controller.active.evaluations, 3)
+        self.assertEqual(controller.active.revision, 2)
+        self.assertEqual(controller.active.previous_conditions, ["finish login and registration"])
+        self.assertEqual(controller.active.last_reason, "")
+        self.assertEqual(controller.consecutive_blocks, 0)
+        self.assertIsNone(controller.user_input.pending)
+
+        controller.edit("verify login tests")
+        self.assertEqual(controller.active.revision, 3)
+        self.assertEqual(controller.active.previous_conditions,
+                         ["finish login and registration", "finish login only"])
+
+    def test_invalid_edit_keeps_goal_and_pending_question_unchanged(self):
+        controller = GoalController(Mock())
+        with self.assertRaises(GoalError):
+            controller.edit("new goal")
+        self.assertIsNone(controller.active)
+        controller.set_goal("finish login")
+        controller.user_input.ask("Which database?")
+        controller.active.status = "blocked"
+        controller.active.last_reason = "missing database preference"
+        before = copy.deepcopy(vars(controller.active))
+        question = controller.user_input.pending
+        for condition in ["", " ", "x" * 4001]:
+            with self.subTest(condition=condition[:10]), self.assertRaises(GoalError):
+                controller.edit(condition)
+            self.assertEqual(vars(controller.active), before)
+            self.assertIs(controller.user_input.pending, question)
+
+    def test_completed_goal_is_retained_but_cannot_resume_without_editing(self):
+        evaluator = Mock()
+        evaluator.evaluate.return_value = GoalEvaluation("complete", "login tests passed")
+        controller = GoalController(evaluator)
+        controller.set_goal("finish login")
         messages = []
         controller.begin_query(messages)
         with redirect_stdout(io.StringIO()):
             self.assertIsNone(controller.stop_hook(messages))
-        self.assertIsNotNone(controller.active)
-        evaluator.evaluate.assert_not_called()
+        self.assertEqual(controller.active.status, "complete")
+        self.assertEqual(controller.active.last_reason, "login tests passed")
+        self.assertFalse(controller.is_running())
+        self.assertIsNone(controller.stop_hook(messages))
+        evaluator.evaluate.assert_called_once()
+        with self.assertRaises(GoalError):
+            controller.resume()
+        self.assertEqual(controller.active.status, "complete")
+        controller.pause()
+        self.assertEqual(controller.active.status, "complete")
+        controller.edit("finish login and registration")
+        self.assertEqual(controller.active.status, "active")
+        self.assertEqual(controller.active.evaluations, 1)
 
-
-class GoalIntegrationTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        #不读取真实凭据，也不需要安装 API SDK；只替换外部初始化。
-        fake_anthropic = types.ModuleType("anthropic")
-        fake_anthropic.Anthropic = lambda **kwargs: client_with([])
-        fake_skills = types.ModuleType("coding_agent.tools.skills")
-        fake_skills.SKILL_LOADER = types.SimpleNamespace(catalog=lambda: "", load=lambda name: "")
-        real_open = open
-
-        def config_open(path, *args, **kwargs):
-            if Path(path).resolve() == PROJECT_ROOT / "config.json":
-                return io.StringIO(json.dumps({
-                    "api_key": "fake", "base_url": "https://example.invalid",
-                    "model": "worker", "max_tokens": 1000,
-                }))
-            return real_open(path, *args, **kwargs)
-
-        spec = importlib.util.spec_from_file_location("goal_main_under_test", PROJECT_ROOT / "coding_agent" / "agents" / "loop.py")
-        cls.main = importlib.util.module_from_spec(spec)
-        with patch.dict(sys.modules, {"anthropic": fake_anthropic, "coding_agent.tools.skills": fake_skills}), \
-                patch("builtins.open", side_effect=config_open):
-            spec.loader.exec_module(cls.main)
-
-    def setUp(self):
-        self.stack = ExitStack()
-        self.addCleanup(self.stack.close)
-        self.output = io.StringIO()
-        self.stack.enter_context(redirect_stdout(self.output))
-        self.evaluator = Mock()
-        self.goal = GoalController(self.evaluator, block_cap=2)
-        self.main = type(self).main
-        self.stack.enter_context(patch.object(self.main, "GOAL", self.goal))
-        self.stack.enter_context(patch.object(self.main, "session_history", []))
-        #仍走真正的 trigger_hook；替换注册表中的旧 controller 为本测试目标。
-        hook_registry = self.main.trigger_hook.__globals__["HOOKS"]
-        self.stack.enter_context(patch.dict(hook_registry, {"Stop": [self.goal.stop_hook]}))
-        self.stack.enter_context(patch.object(self.main, "COMPACTOR", types.SimpleNamespace(prepare=lambda messages, request: messages)))
-        self.stack.enter_context(patch.object(self.main, "consume_cron_queue", return_value=[]))
-        self.stack.enter_context(patch.object(self.main.team, "consume_lead_inbox", return_value=[]))
-        self.inject = self.stack.enter_context(patch.object(self.main, "inject_background_results", return_value=0))
-
-    def use_worker(self, responses):
-        client = client_with(responses)
-        self.stack.enter_context(patch.object(self.main, "client", client))
-        return client
-
-    def test_unmet_goal_feedback_reaches_next_worker_call(self):
-        client = self.use_worker([text_response("changed"), text_response("verified")])
-        self.evaluator.evaluate.side_effect = [GoalEvaluation("continue", "missing tests"), GoalEvaluation("complete", "tests passed")]
-        self.main.submit_query("/goal tests pass")
-        self.assertIsNone(self.goal.active)
-        self.assertEqual(len(client.messages.calls), 2)
-        self.assertIn("missing tests", str(client.messages.calls[1]["messages"]))
-        self.assertIn("tests pass", client.messages.calls[1]["system"])
-        self.assertEqual(self.main.session_history[0]["content"], "tests pass")
-
-    def test_tool_results_are_seen_by_gate_only_after_worker_stops(self):
-        tool = types.SimpleNamespace(type="tool_use", id="test-1", name="bash", input={"command": "test"})
-        client = self.use_worker([types.SimpleNamespace(content=[tool]), text_response("verified")])
-        self.evaluator.evaluate.return_value = GoalEvaluation("complete", "tests passed")
-        self.stack.enter_context(patch.object(self.main, "execute_tool", return_value="exit_code=0"))
-        self.main.submit_query("/goal tests pass")
-        self.assertEqual(len(client.messages.calls), 2)
-        self.evaluator.evaluate.assert_called_once()
-        history = self.evaluator.evaluate.call_args.args[1]
-        self.assertIn("exit_code=0", str(history))
-
-    def test_normal_query_never_calls_gate_model(self):
-        self.use_worker([text_response("answer")])
-        self.main.submit_query("explain this")
-        self.evaluator.evaluate.assert_not_called()
-
-    def test_subagent_inherits_the_leads_assignment_directory(self):
-        from coding_agent.runtime import workspace
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory).resolve()
-            task_dir = root / "assigned-task"
-            task_dir.mkdir()
-            sub_client = client_with([
-                tool_response(tool_call("write_file", {"path": "result.txt", "content": "done"})),
-                text_response("written"),
-            ])
-            with patch.object(workspace, "WORKDIR", root), \
-                    patch.object(self.main.team, "assignment_cwd", return_value=task_dir), \
-                    patch.dict(self.main.run_subagent.__globals__, {"client": sub_client}):
-                self.main.TOOL_HANDLERS["task"]("write the result")
-            self.assertEqual((task_dir / "result.txt").read_text(), "done")
-            self.assertFalse((root / "result.txt").exists())
-            self.assertIn(str(task_dir), sub_client.messages.calls[0]["system"])
-
-    def test_completed_lead_task_does_not_block_next_assignment(self):
-        from coding_agent.runtime import workspace
-        team = self.main.team
-        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
-            root = Path(directory).resolve()
-            tasks = root / ".tasks"
-            for module, name, value in (
-                (workspace, "WORKDIR", root), (team, "WORKDIR", root),
-                (team, "TASKS_DIR", tasks), (team, "TASKS_ROOT", tasks),
-                (team, "TASK_LOCK_PATH", tasks / ".lock"),
-                (team, "teammate_assignments", {}), (team, "assignment_versions", {}),
-            ):
-                stack.enter_context(patch.object(module, name, value))
-            first = team.create_task("first")
-            second = team.create_task("second")
-            team.claim_task(first.id)
-            self.use_worker([
-                tool_response(tool_call("complete_task", {"task_id": first.id})),
-                text_response("completed"),
-            ])
-            self.main.submit_query("finish the first task")
-            self.assertTrue(team.claim_task(second.id).startswith("Claimed "))
-
-    def test_status_and_clear_commands_do_not_call_worker(self):
-        client = self.use_worker([])
-        self.goal.set_goal("tests pass")
-        self.main.submit_query("/goal")
-        self.assertIsNotNone(self.goal.active)
-        self.main.submit_query("/goal clear")
-        self.assertIsNone(self.goal.active)
-        self.assertEqual(client.messages.calls, [])
-        self.assertEqual(self.main.session_history, [])
-
-    def test_block_limit_returns_without_claiming_completion(self):
-        client = self.use_worker([text_response("pending")] * 3)
-        self.evaluator.evaluate.return_value = GoalEvaluation("continue", "missing tests")
-        self.main.submit_query("/goal tests pass")
-        self.assertEqual(len(client.messages.calls), 3)
-        self.assertIsNotNone(self.goal.active)
-        self.assertIn("limit", self.goal.last_status)
-
-    def test_evaluator_error_keeps_goal_active(self):
-        self.use_worker([text_response("candidate")])
-        self.evaluator.evaluate.side_effect = GoalError("invalid JSON")
-        self.main.submit_query("/goal tests pass")
-        self.assertIsNotNone(self.goal.active)
-        self.assertIn("error", self.goal.last_status)
-
-    def test_blocked_goal_is_retained_until_user_resumes(self):
-        self.use_worker([text_response("cannot proceed")])
-        self.evaluator.evaluate.return_value = GoalEvaluation("blocked", "resource unavailable")
-        self.main.submit_query("/goal tests pass")
-        self.assertIsNotNone(self.goal.active)
-        self.assertEqual(self.goal.active.status, "blocked")
-        self.assertFalse(self.goal.can_run_automatically())
-        self.use_worker([text_response("verified")])
-        self.evaluator.evaluate.return_value = GoalEvaluation("complete", "resource restored")
-        self.main.submit_query("资源已恢复，请继续")
-        self.assertIsNone(self.goal.active)
-
-    def test_worker_turn_limit_also_covers_repeated_tool_calls(self):
-        tool = types.SimpleNamespace(type="tool_use", id="t1", name="bash", input={"command": "test"})
-        client = self.use_worker([types.SimpleNamespace(content=[tool])])
-        self.stack.enter_context(patch.object(self.main, "GOAL_MAX_TURNS", 1))
-        self.stack.enter_context(patch.object(self.main, "execute_tool", return_value="still pending"))
-        self.main.submit_query("/goal tests pass")
-        self.assertEqual(len(client.messages.calls), 1)
-        self.assertIsNotNone(self.goal.active)
-        self.evaluator.evaluate.assert_not_called()
-
-    def test_new_background_evidence_goes_to_worker_before_gate(self):
-        client = self.use_worker([text_response("waiting"), text_response("verified")])
-        count = 0
-
-        def inject_once(messages):
-            nonlocal count
-            count += 1
-            if count == 2:
-                messages.append({"role": "user", "content": "[Background completed] exit_code=0"})
-                return 1
-            return 0
-
-        self.inject.side_effect = inject_once
-        self.evaluator.evaluate.return_value = GoalEvaluation("complete", "verified")
-        self.main.submit_query("/goal tests pass")
-        self.evaluator.evaluate.assert_called_once()
-        self.assertIsNone(self.goal.active)
-        self.assertIn("exit_code=0", str(client.messages.calls[1]["messages"]))
-
-    def test_ask_user_waits_without_goal_and_delivers_real_answer(self):
-        client = self.use_worker([
-            tool_response(tool_call("ask_user", {"question": "Which database?",
-                          "options": ["SQLite", "PostgreSQL"]}, "ask-1")),
-            text_response("Using PostgreSQL"),
-        ])
-        self.main.submit_query("build app")
-        self.assertEqual(len(client.messages.calls), 1)
-        self.assertIn("Which database?", self.output.getvalue())
-        self.assertIn("2. PostgreSQL", self.output.getvalue())
-        self.assertIsNotNone(self.goal.user_input.pending)
-        self.main.submit_query("2")
-        self.assertIsNone(self.goal.user_input.pending)
-        history = client.messages.calls[1]["messages"]
-        result = json.loads(history[-2]["content"][0]["content"])
-        self.assertEqual(result["status"], "answered")
-        self.assertEqual(result["answer"], "PostgreSQL")
-        self.assertEqual(history[-1]["content"], "PostgreSQL")
-        self.evaluator.evaluate.assert_not_called()
-
-    def test_ask_user_bypasses_goal_gate_then_resumes_goal(self):
-        client = self.use_worker([
-            tool_response(tool_call("ask_user", {"question": "Which database?"})),
-            text_response("verified"),
-        ])
-        self.main.submit_query("/goal build app")
-        self.assertEqual(self.goal.active.status, "waiting_user")
-        self.evaluator.evaluate.assert_not_called()
-        self.assertFalse(self.goal.can_run_automatically())
-        self.evaluator.evaluate.return_value = GoalEvaluation("complete", "verified")
-        self.main.submit_query("PostgreSQL")
-        self.assertIsNone(self.goal.active)
-        self.assertEqual(len(client.messages.calls), 2)
-        self.evaluator.evaluate.assert_called_once()
-
-    def test_entire_tool_batch_is_deferred_when_it_contains_ask_user(self):
-        client = self.use_worker([tool_response(
-            tool_call("write_file", {"path": "db.py", "content": "bad default"}, "write-1"),
-            tool_call("ask_user", {"question": "Which database?"}, "ask-1"),
-            tool_call("bash", {"command": "initialize db"}, "bash-1"),
-        )])
-        execute = self.stack.enter_context(patch.object(self.main, "execute_tool"))
-        self.main.submit_query("/goal build app")
-        execute.assert_not_called()
-        results = self.main.session_history[-1]["content"]
-        self.assertEqual([result["tool_use_id"] for result in results], ["write-1", "ask-1", "bash-1"])
-        self.assertEqual([result["is_error"] for result in results], [True, False, True])
-        self.assertEqual(json.loads(results[1]["content"])["status"], "waiting_user")
-        self.assertEqual(len(client.messages.calls), 1)
-
-    def test_skipped_operation_executes_only_when_reissued_after_answer(self):
-        self.use_worker([
-            tool_response(tool_call("ask_user", {"question": "Which database?"}, "ask-1"),
-                          tool_call("write_file", {"path": "db.py", "content": "default"}, "skip-1")),
-            tool_response(tool_call("write_file", {"path": "db.py", "content": "PostgreSQL"}, "write-2")),
-            text_response("written"),
-        ])
-        execute = self.stack.enter_context(patch.object(self.main, "execute_tool", return_value="written"))
-        self.main.submit_query("build app")
-        execute.assert_not_called()
-        self.main.submit_query("PostgreSQL")
-        execute.assert_called_once()
-        block = execute.call_args.args[0]
-        self.assertEqual(block.id, "write-2")
-        self.assertEqual(block.input["content"], "PostgreSQL")
-
-    def test_gate_wait_user_displays_question_and_resumes_after_answer(self):
-        client = self.use_worker([text_response("I need your preference"), text_response("verified")])
-        self.evaluator.evaluate.side_effect = [
-            GoalEvaluation("wait_user", "missing database preference", "Which database?", ("SQLite", "PostgreSQL")),
-            GoalEvaluation("complete", "verified"),
-        ]
-        self.main.submit_query("/goal build app")
-        self.assertEqual(len(client.messages.calls), 1)
-        self.assertEqual(self.goal.active.status, "waiting_user")
-        self.assertIn("Which database?", self.output.getvalue())
-        self.main.submit_query("2")
-        self.assertEqual(client.messages.calls[1]["messages"][-1]["content"], "PostgreSQL")
-        self.assertIn("Which database?", str(client.messages.calls[1]["messages"]))
-        self.assertIsNone(self.goal.active)
-
-    def test_automatic_events_cannot_answer_pending_question(self):
-        client = self.use_worker([])
-        self.goal.set_goal("build app")
-        self.goal.user_input.ask("Which database?")
-        self.goal.wait_for_user("missing preference")
-        self.main.agent_loop(self.main.session_history)
-        self.assertEqual(client.messages.calls, [])
-        self.main.consume_cron_queue.assert_not_called()
-        self.main.team.consume_lead_inbox.assert_not_called()
-        self.inject.assert_not_called()
-        self.assertIsNotNone(self.goal.user_input.pending)
-
-    def test_queue_processor_preserves_events_while_waiting(self):
-        client = self.use_worker([])
-        self.goal.user_input.ask("Which database?")
-        self.stack.enter_context(patch.object(self.main, "has_cron_queue", return_value=True))
-        self.stack.enter_context(patch.object(self.main.RUNTIME_STOP, "wait", side_effect=[False, True]))
-        self.main.queue_processor_loop()
-        self.main.consume_cron_queue.assert_not_called()
-        self.assertEqual(client.messages.calls, [])
-        self.assertTrue(self.main.agent_lock.acquire(blocking=False))
-        self.main.agent_lock.release()
-
-    def test_status_and_invalid_option_leave_question_pending(self):
-        client = self.use_worker([tool_response(tool_call("ask_user", {
-            "question": "Which database?", "options": ["SQLite", "PostgreSQL"],
-        }))])
-        self.main.submit_query("/goal build app")
-        self.main.submit_query("/goal")
-        self.main.submit_query("9")
-        self.main.submit_query(" ")
-        self.assertEqual(len(client.messages.calls), 1)
-        self.assertIsNotNone(self.goal.user_input.pending)
-        self.assertEqual(self.goal.active.status, "waiting_user")
-
-    def test_clear_cancels_pending_tool_question_without_calling_worker(self):
-        client = self.use_worker([tool_response(tool_call("ask_user", {"question": "Which database?"}))])
-        self.main.submit_query("/goal build app")
-        self.main.submit_query("/goal clear")
-        self.assertIsNone(self.goal.active)
-        self.assertIsNone(self.goal.user_input.pending)
-        result = json.loads(self.main.session_history[-1]["content"][0]["content"])
-        self.assertEqual(result["status"], "cancelled")
-        self.assertEqual(len(client.messages.calls), 1)
-
-    def test_replacing_goal_cancels_old_question(self):
-        client = self.use_worker([
-            tool_response(tool_call("ask_user", {"question": "Which database?"})),
-            text_response("new task done"),
-        ])
-        self.main.submit_query("/goal build app")
-        self.evaluator.evaluate.return_value = GoalEvaluation("complete", "new task verified")
-        self.main.submit_query("/goal document the existing app")
-        self.assertIsNone(self.goal.user_input.pending)
-        history = client.messages.calls[1]["messages"]
-        self.assertEqual(json.loads(history[-2]["content"][0]["content"])["status"], "cancelled")
-        self.assertEqual(history[-1]["content"], "document the existing app")
-
-    def test_invalid_ask_arguments_return_tool_error_and_allow_retry(self):
-        client = self.use_worker([
-            tool_response(tool_call("ask_user", {"question": " "}, "bad-ask")),
-            tool_response(tool_call("ask_user", {"question": "Which database?"}, "good-ask")),
-        ])
-        self.main.submit_query("build app")
-        self.assertTrue(client.messages.calls[1]["messages"][-1]["content"][0]["is_error"])
-        self.assertEqual(self.goal.user_input.pending.tool_use_id, "good-ask")
-
-    def test_multiple_ask_calls_are_rejected_with_paired_results(self):
-        client = self.use_worker([
-            tool_response(tool_call("ask_user", {"question": "db?"}, "ask-1"),
-                          tool_call("ask_user", {"question": "region?"}, "ask-2")),
-            tool_response(tool_call("ask_user", {"question": "Which database?"}, "ask-3")),
-        ])
-        self.main.submit_query("build app")
-        results = client.messages.calls[1]["messages"][-1]["content"]
-        self.assertEqual([result["tool_use_id"] for result in results], ["ask-1", "ask-2"])
-        self.assertTrue(all(result["is_error"] for result in results))
-        self.assertEqual(self.goal.user_input.pending.tool_use_id, "ask-3")
+    def test_inactive_goal_preserves_reason_when_an_unrelated_turn_asks_for_input(self):
+        for status in ["paused", "blocked", "complete"]:
+            with self.subTest(status=status):
+                controller = GoalController(Mock())
+                controller.set_goal("finish login")
+                controller.active.status = status
+                controller.active.last_reason = "retained goal reason"
+                controller.wait_for_user("Which explanation level?")
+                self.assertEqual(controller.active.status, status)
+                self.assertEqual(controller.active.last_reason, "retained goal reason")
+                self.assertNotIn("finish login", controller.worker_context())
+                self.assertFalse(controller.is_running())
 
 
 if __name__ == "__main__":

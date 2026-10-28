@@ -1,0 +1,49 @@
+{
+  "mcpServers": {
+    "browser": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "chrome-devtools-mcp@latest",
+        "--headless",
+        "--isolated",
+        "--no-javascript-evaluation",
+        "--no-file-navigations",
+        "--no-usage-statistics",
+        "--no-performance-crux",
+        "--redact-network-headers",
+        "--allowed-url-pattern=http://localhost:*/*",
+        "--allowed-url-pattern=http://127.0.0.1:*/*"
+      ],
+      "env": {
+        "CHROME_DEVTOOLS_MCP_NO_CONFIG_DISCOVERY": "1",
+        "CHROME_DEVTOOLS_MCP_NO_UPDATE_CHECKS": "1"
+      },
+      "allowed_tools": [
+        "list_pages",
+        "new_page",
+        "select_page",
+        "close_page",
+        "navigate_page",
+        "take_snapshot",
+        "take_screenshot",
+        "click",
+        "fill",
+        "fill_form",
+        "press_key",
+        "hover",
+        "resize_page",
+        "wait_for",
+        "list_console_messages",
+        "get_console_message",
+        "list_network_requests",
+        "get_network_request"
+      ],
+      "read_only_tools": [],
+      "auto_approve": [],
+      "connect_timeout": 60,
+      "timeout": 90
+    }
+  }
+}
